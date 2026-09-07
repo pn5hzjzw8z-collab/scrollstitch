@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ScrollStitch</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;background:#f5f5f7;color:#111;padding:24px}
+main{max-width:700px;margin:auto;background:white;border-radius:20px;padding:22px;box-sizing:border-box}
+h1{margin-top:0}
+button{font-size:18px;padding:14px 18px;border:0;border-radius:14px;background:#111;color:white;width:100%;margin:8px 0}
+input{width:100%;font-size:16px;margin:10px 0}
+#status{white-space:pre-wrap;background:#f0f0f2;border-radius:12px;padding:12px;margin-top:12px}
+</style>
+</head>
+<body>
+<main>
+<h1>📱 ScrollStitch</h1>
+<p>①スクロールして撮影 → ②画像を複数選択 → ③重なりを自動検出 → ④1枚の縦長画像に結合</p>
+<input id="files" type="file" accept="image/*" multiple>
+<button id="go">🔗 重なりを自動検出して結合</button>
+<div id="status">画像を選択してください。</div>
+<canvas id="canvas" style="display:none"></canvas>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+const status=t=>{$('status').textContent=t};
+
+function loadImage(file){
+  return new Promise((resolve,reject)=>{
+    const u=URL.createObjectURL(file), im=new Image();
+    im.onload=()=>{URL.revokeObjectURL(u);resolve(im)};
+    im.onerror=reject; im.src=u;
+  });
+}
+
+// 画像を小さくして、RGBではなく明るさ＋エッジ情報を作る
+function makeData(im,W=320){
+  const H=Math.max(1,Math.round(im.naturalHeight*W/im.naturalWidth));
+  const c=document.createElement('canvas'); c.width=W;c.height=H;
+  const x=c.getContext('2d',{willReadFrequently:true});
+  x.drawImage(im,0,0,W,H);
+  const p=x.getImageData(0,0,W,H).data;
+  const g=new Float32Array(W*H);
+  for(let i=0,j=0;i<g.length;i++,j+=4)
+    g[i]=0.299*p[j]+0.587*p[j+1]+0.114*p[j+2];
+  return {W,H,g};
+}
+
+// 固定ヘッダーなどの影響を減らすため、中央～下部の情報を主に比較
+function scorePair(A,B,o){
+  const W=A.W, maxW=Math.min(W,B.W);
+  const bands=[0.10,0.28,0.46,0.64,0.82,0.94];
+  let sum=0,n=0;
+  const step=Math.max(2,Math.floor(W/160));
+  for(const f of bands){
+    const k=Math.max(0,Math.min(o-2,Math.floor(o*f)));
+    const ya=A.H-o+k, yb=k;
+    if(ya<0||yb<0||ya>=A.H||yb>=B.H) continue;
+    for(let x=Math.floor(W*.08);x<Math.floor(W*.92);x+=step){
+      const a=A.g[ya*W+x], b=B.g[yb*W+x];
+      sum+=Math.min(255,Math.abs(a-b)); n++;
+      if(x+1<W && ya+1<A.H && yb+1<B.H){
+        const ea=Math.abs(A.g[(ya+1)*W+x]-a);
+        const eb=Math.abs(B.g[(yb+1)*W+x]-b);
+        sum+=1.6*Math.min(255,Math.abs(ea-eb)); n+=1.6;
+      }
+    }
+  }
+  return n?sum/n:999;
+}
+
+// 1枚前の下端と次の画像の上端が一致する「重なり高さ」を探索
+function detectOverlap(A,B){
+  const minO=Math.max(20,Math.floor(Math.min(A.H,B.H)*0.08));
+  const maxO=Math.floor(Math.min(A.H,B.H)*0.82);
+  let best={o:minO,s:Infinity};
+
+  // 粗く探索
+  for(let o=minO;o<=maxO;o+=4){
+    const s=scorePair(A,B,o);
+    if(s<best.s)best={o,s};
+  }
+  // 細かく再探索
+  const lo=Math.max(minO,best.o-10), hi=Math.min(maxO,best.o+10);
+  for(let o=lo;o<=hi;o++){
+    const s=scorePair(A,B,o);
+    if(s<best.s)best={o,s};
+  }
+
+  // スコアを信頼度へ変換
+  const confidence=Math.max(0,Math.min(1,1-best.s/70));
+  return {overlap:best.o,score:best.s,confidence};
+}
+
+$('go').onclick=async()=>{
+  const fs=[...$('files').files];
+  if(fs.length<2){status('画像を2枚以上選択してください。');return}
+  try{
+    status('画像を読み込み中…');
+    const ims=await Promise.all(fs.map(loadImage));
+    const data=ims.map(im=>makeData(im));
+
+    let overlaps=[];
+    for(let i=1;i<data.length;i++){
+      status(`重なりを検出中… ${i}/${data.length-1}`);
+      const r=detectOverlap(data[i-1],data[i]);
+      overlaps.push(r);
+    }
+
+    let msg='検出結果\\n';
+    overlaps.forEach((r,i)=>{
+      msg+=`${i+1}→${i+2}: ${r.overlap} px / 信頼度 ${(r.confidence*100).toFixed(0)}%\\n`;
+    });
+    status(msg+'\\n画像を結合しています…');
+
+    const scale=ims[0].naturalWidth/data[0].W;
+    let totalH=ims[0].naturalHeight;
+    for(let i=1;i<ims.length;i++){
+      const crop=Math.round(overlaps[i-1].overlap*scale);
+      totalH+=Math.max(1,ims[i].naturalHeight-crop);
+    }
+    if(totalH>30000){
+      status(msg+'\\n⚠️ 出力が大きすぎます（30,000px超）。画像枚数を減らしてください。');
+      return;
+    }
+
+    const c=$('canvas'); c.width=ims[0].naturalWidth;c.height=totalH;
+    const ctx=c.getContext('2d');
+    let y=0;
+    for(let i=0;i<ims.length;i++){
+      const crop=i===0?0:Math.round(overlaps[i-1].overlap*ims[i].naturalWidth/data[i].W);
+      ctx.drawImage(ims[i],0,crop,ims[i].naturalWidth,ims[i].naturalHeight-crop,0,y,ims[i].naturalWidth,ims[i].naturalHeight-crop);
+      y+=ims[i].naturalHeight-crop;
+    }
+
+    c.toBlob(blob=>{
+      const a=document.createElement('a');
+      a.href=URL.createObjectURL(blob);
+      a.download='ScrollStitch_result.png';
+      a.click();
+      setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+      status(msg+'\\n\\n✅ 結合完了！「ScrollStitch_result.png」を保存しました。');
+    },'image/png');
+  }catch(e){
+    console.error(e);
+    status('⚠️ エラーが発生しました。画像を選び直して再試行してください。');
+  }
+};
+</script>
+</body>
+</html>
