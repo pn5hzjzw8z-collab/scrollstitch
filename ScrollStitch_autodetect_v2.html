@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111111">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>ScrollStitch</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f2f2f7;font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue",sans-serif;color:#111}
+main{max-width:720px;margin:auto;padding:20px 14px 45px}
+.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;box-shadow:0 2px 10px #0001}
+h1{margin:4px 0 5px;font-size:28px}.sub{color:#666;margin-bottom:18px}
+.btn{display:block;width:100%;padding:15px;margin:8px 0;border:0;border-radius:13px;background:#111;color:#fff;font-size:17px;font-weight:700}
+.secondary{background:#e8e8ed;color:#111}
+#pick{display:none}
+#list{margin-top:12px}.item{display:flex;align-items:center;gap:9px;padding:8px 0;border-bottom:1px solid #eee}
+.item img{width:58px;height:58px;object-fit:cover;border-radius:8px}.num{font-weight:700;width:24px;text-align:center}
+.actions{margin-left:auto;display:flex;gap:4px}.mini{border:0;border-radius:8px;padding:7px 9px;background:#e8e8ed;font-weight:700}
+.mini:disabled{opacity:.35}
+#status{color:#666;white-space:pre-wrap;line-height:1.5}
+#result{width:100%;border-radius:10px;margin-top:12px;display:none}
+small{color:#777}.error{color:#b00020!important}
+</style>
+</head>
+<body>
+<main>
+<h1>ScrollStitch</h1>
+<div class="sub">iPhone / iPadでスクショを縦長に自動結合</div>
+
+<div class="card">
+<button class="btn" id="pickBtn" type="button">📷 写真からスクショを選ぶ</button>
+<input id="pick" type="file" accept="image/*" multiple>
+<button class="btn secondary" id="clear" type="button">選択をクリア</button>
+<div id="status">写真を2枚以上選択してください。</div>
+<div id="list"></div>
+</div>
+
+<div class="card">
+<button class="btn" id="go" type="button">🔗 重なりを自動検出して結合</button>
+<img id="result" alt="結合結果">
+<button class="btn secondary" id="save" type="button" style="display:none">⬇️ PNGを保存</button>
+<canvas id="canvas" style="display:none"></canvas>
+</div>
+</main>
+
+<script>
+const pick=document.getElementById('pick');
+const pickBtn=document.getElementById('pickBtn');
+const list=document.getElementById('list');
+const status=document.getElementById('status');
+const result=document.getElementById('result');
+const canvas=document.getElementById('canvas');
+const save=document.getElementById('save');
+let files=[];
+
+pickBtn.addEventListener('click',()=>pick.click());
+pick.addEventListener('change',e=>{
+  const chosen=Array.from(e.target.files||[]).filter(f=>f.type.startsWith('image/'));
+  if(!chosen.length){status.textContent='写真が選択されませんでした。';return}
+  files.push(...chosen); render(); pick.value='';
+});
+document.getElementById('clear').onclick=()=>{
+  files=[]; list.innerHTML=''; result.style.display='none'; save.style.display='none';
+  status.textContent='写真を2枚以上選択してください。';
+};
+
+function render(){
+  list.innerHTML='';
+  files.forEach((f,i)=>{
+    const d=document.createElement('div'); d.className='item';
+    const n=document.createElement('div'); n.className='num'; n.textContent=i+1;
+    const im=document.createElement('img');
+    const r=new FileReader(); r.onload=()=>im.src=r.result; r.readAsDataURL(f);
+    const t=document.createElement('div'); t.textContent=f.name||`画像 ${i+1}`;
+    const actions=document.createElement('div'); actions.className='actions';
+    const up=document.createElement('button'); up.className='mini'; up.textContent='↑'; up.disabled=i===0;
+    const down=document.createElement('button'); down.className='mini'; down.textContent='↓'; down.disabled=i===files.length-1;
+    up.onclick=()=>{[files[i-1],files[i]]=[files[i],files[i-1]];render()};
+    down.onclick=()=>{[files[i],files[i+1]]=[files[i+1],files[i]];render()};
+    actions.append(up,down); d.append(n,im,t,actions); list.append(d);
+  });
+  status.textContent=files.length<2?`現在 ${files.length}枚。2枚以上選択してください。`:`${files.length}枚選択済み。順番を確認して「重なりを自動検出して結合」を押してください。`;
+}
+
+function load(f){
+  return new Promise((ok,no)=>{
+    const r=new FileReader();
+    r.onload=()=>{
+      const i=new Image();
+      i.onload=()=>ok(i);
+      i.onerror=()=>no(new Error('画像を読み込めません'));
+      i.src=r.result;
+    };
+    r.onerror=()=>no(r.error||new Error('画像ファイルを読み込めません'));
+    r.readAsDataURL(f);
+  });
+}
+
+function makeGray(im,W){
+  const H=Math.max(1,Math.round(im.naturalHeight*W/im.naturalWidth));
+  const c=document.createElement('canvas'); c.width=W;c.height=H;
+  const x=c.getContext('2d',{willReadFrequently:true});
+  x.drawImage(im,0,0,W,H);
+  const d=x.getImageData(0,0,W,H).data;
+  const g=new Float32Array(W*H);
+  for(let p=0,j=0;p<d.length;p+=4,j++) g[j]=.299*d[p]+.587*d[p+1]+.114*d[p+2];
+  return {g,W,H};
+}
+
+function corr(a,b){
+  const n=Math.min(a.length,b.length);
+  let ma=0,mb=0;
+  for(let i=0;i<n;i++){ma+=a[i];mb+=b[i]}
+  ma/=n; mb/=n;
+  let aa=0,bb=0,ab=0;
+  for(let i=0;i<n;i++){
+    const x=a[i]-ma,y=b[i]-mb;
+    aa+=x*x; bb+=y*y; ab+=x*y;
+  }
+  return ab/Math.sqrt(aa*bb+1e-8);
+}
+
+/* 前画像の下側と、次画像の上側を同じ高さで比較。
+   実際のスクロールで重なった部分はほぼ同一画像なので、
+   重なり高さを変えながら相関が最大になる位置を探す。 */
+function detectOverlap(a,b){
+  const W=240;
+  const A=makeGray(a,W), B=makeGray(b,W);
+  const maxO=Math.min(Math.floor(A.H*.85),Math.floor(B.H*.85));
+  const minO=Math.max(40,Math.floor(Math.min(A.H,B.H)*.08));
+  let best={score:-Infinity,overlap:0};
+
+  // 大まかに探索→最良付近を細かく探索
+  const candidates=[];
+  for(let o=minO;o<=maxO;o+=8)candidates.push(o);
+
+  for(const o of candidates){
+    const ar=A.g.slice((A.H-o)*W,A.H*W);
+    const br=B.g.slice(0,o*W);
+    let s=corr(ar,br);
+    // 中央付近を少し重視。単色画面の誤検出を抑える。
+    if(s>best.score)best={score:s,overlap:o};
+  }
+
+  const start=Math.max(minO,best.overlap-12);
+  const end=Math.min(maxO,best.overlap+12);
+  for(let o=start;o<=end;o++){
+    const ar=A.g.slice((A.H-o)*W,A.H*W);
+    const br=B.g.slice(0,o*W);
+    const s=corr(ar,br);
+    if(s>best.score)best={score:s,overlap:o};
+  }
+
+  return {score:best.score, overlapPx:best.overlap, scale:W/b.naturalWidth};
+}
+
+document.getElementById('go').onclick=async()=>{
+  if(files.length<2){status.textContent='まず写真を2枚以上選択してください。';return}
+  try{
+    status.classList.remove('error');
+    result.style.display='none'; save.style.display='none';
+    status.textContent='画像を読み込んでいます…';
+    const ims=await Promise.all(files.map(load));
+    const width=Math.max(...ims.map(i=>i.naturalWidth));
+    const crops=[0];
+
+    for(let i=1;i<ims.length;i++){
+      status.textContent=`重なりを自動検出中… ${i}/${ims.length-1}`;
+      const r=detectOverlap(ims[i-1],ims[i]);
+      // 相関が低い場合は安全側に10%だけ削る
+      const crop=r.score>=0.55
+        ? Math.max(0,Math.round(r.overlapPx/r.scale))
+        : Math.round(ims[i].naturalHeight*.10);
+      crops.push(crop);
+    }
+
+    let height=0;
+    ims.forEach((im,i)=>{
+      const h=Math.max(1,im.naturalHeight-crops[i]);
+      height+=h*width/im.naturalWidth;
+    });
+
+    const maxH=30000;
+    if(height>maxH){
+      status.classList.add('error');
+      status.textContent=`結合後が約${Math.round(height)}pxになるため、画像枚数を減らしてください。`;
+      return;
+    }
+
+    canvas.width=width; canvas.height=Math.ceil(height);
+    const ctx=canvas.getContext('2d');
+    let y=0;
+    ims.forEach((im,i)=>{
+      const h=Math.max(1,im.naturalHeight-crops[i]);
+      const dh=h*width/im.naturalWidth;
+      ctx.drawImage(im,0,crops[i],im.naturalWidth,h,0,y,width,dh);
+      y+=dh;
+    });
+
+    result.src=canvas.toDataURL('image/png');
+    result.style.display='block'; save.style.display='block';
+    status.textContent='✅ 重なりを自動検出して結合完了！';
+  }catch(e){
+    console.error(e);
+    status.classList.add('error');
+    status.textContent='画像を読み込めませんでした。HEIC/HEIFの場合は、iPhone/iPadの写真をスクリーンショットにしてから選んでください。';
+  }
+};
+
+save.onclick=()=>{
+  canvas.toBlob(blob=>{
+    if(!blob){status.textContent='PNGの作成に失敗しました。';return}
+    const u=URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=u; a.download='ScrollStitch.png';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(u),2000);
+  },'image/png');
+};
+</script>
+</body>
+</html>
