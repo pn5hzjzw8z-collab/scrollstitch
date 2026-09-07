@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>ScrollStitch v10</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f2f2f7;font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:#111}
+main{max-width:720px;margin:auto;padding:18px 14px 40px}
+h1{margin:4px 0 5px;font-size:28px}
+.sub{color:#666;margin:0 0 14px}
+.card{background:#fff;border-radius:18px;padding:16px;margin:12px 0}
+.btn{display:block;width:100%;padding:15px;margin:8px 0;border:0;border-radius:12px;font-size:17px;font-weight:600;background:#111;color:#fff}
+.secondary{background:#e8e8ed;color:#111}
+#pick{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
+#list{margin-top:10px}
+.item{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #eee}
+.item img{width:58px;height:58px;object-fit:cover;border-radius:8px}
+.item span{font-size:13px;flex:1;word-break:break-all}
+#status{color:#555;white-space:pre-wrap;line-height:1.5}
+#result{width:100%;border-radius:10px;margin-top:12px;display:none}
+small{color:#777}
+.ok{color:#087a00}
+.warn{color:#9a6500}
+.err{color:#b00020}
+</style>
+</head>
+<body>
+<main>
+<h1>📜 ScrollStitch v10</h1>
+<div class="sub">スクロール撮影 → 複数選択 → 重複部分を自動検出 → 結合</div>
+
+<div class="card">
+<label class="btn" style="position:relative;text-align:center;cursor:pointer">🖼️ 写真を選択
+<input id="pick" type="file" accept="image/*" multiple>
+</label>
+<button class="btn secondary" id="clear" type="button">選択をクリア</button>
+<div id="status">写真を2枚以上選択してください。</div>
+<div id="list"></div>
+</div>
+
+<div class="card">
+<button class="btn" id="go" type="button">🔗 重複部分を自動検出して結合</button>
+<div id="diag"></div>
+<img id="result" alt="結合結果">
+<button class="btn secondary" id="save" type="button" style="display:none">💾 結合画像を保存</button>
+</div>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+const status=t=>{$('status').textContent=t};
+let files=[];
+
+$('pick').onchange=()=>{
+  files=[...$('pick').files];
+  renderList();
+};
+$('clear').onclick=()=>{
+  files=[];$('pick').value='';$('list').innerHTML='';$('diag').innerHTML='';
+  $('result').style.display='none';$('save').style.display='none';
+  status('写真を2枚以上選択してください。');
+};
+
+function renderList(){
+  $('list').innerHTML='';
+  files.forEach((f,i)=>{
+    const d=document.createElement('div');d.className='item';
+    const im=document.createElement('img');im.src=URL.createObjectURL(f);
+    const s=document.createElement('span');s.textContent=(i+1)+'. '+f.name;
+    d.append(im,s);$('list').append(d);
+  });
+  status(files.length>=2?files.length+'枚選択中。順番は選択された順です。':'写真を2枚以上選択してください。');
+}
+function loadImage(file){
+  return new Promise((resolve,reject)=>{
+    const u=URL.createObjectURL(file), im=new Image();
+    im.onload=()=>{URL.revokeObjectURL(u);resolve(im)};
+    im.onerror=reject;im.src=u;
+  });
+}
+
+/*
+  v7 overlap detector
+  - 前版の「行だけのNCC」から、実際の画面の2Dパターンも使う方式へ変更
+  - Aの下側とBの上側を直接比較
+  - 縦スクロール量を広く探索（重複97%まで対応）
+  - 色そのものより、明るさ＋横/縦エッジを使う
+  - 平坦な行は重みを下げる
+  - 複数の横位置を同時に比較し、偶然の一致を避ける
+*/
+
+const SAMPLE_W=300;
+const BINS=75;
+
+function grayAt(d,p){
+  return 0.299*d[p]+0.587*d[p+1]+0.114*d[p+2];
+}
+
+function makeFeatures(im){
+  const W=SAMPLE_W;
+  const H=Math.max(1,Math.round(im.naturalHeight*W/im.naturalWidth));
+  const c=document.createElement('canvas');
+  c.width=W;c.height=H;
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  ctx.drawImage(im,0,0,W,H);
+  const d=ctx.getImageData(0,0,W,H).data;
+
+  const feat=new Float32Array(H*BINS);
+  const energy=new Float32Array(H);
+
+  for(let y=0;y<H;y++){
+    let total=0;
+    for(let b=0;b<BINS;b++){
+      const x0=Math.floor(b*W/BINS);
+      const x1=Math.max(x0+1,Math.floor((b+1)*W/BINS));
+      let s=0,n=0;
+      for(let x=x0;x<x1;x++){
+        const xr=Math.min(W-1,x+1);
+        const p=(y*W+x)*4,q=(y*W+xr)*4;
+        let v=Math.abs(grayAt(d,p)-grayAt(d,q));
+        if(y>0){
+          const u=((y-1)*W+x)*4;
+          v+=0.75*Math.abs(grayAt(d,p)-grayAt(d,u));
+        }
+        s+=v;n++;
+      }
+      const v=s/n;
+      feat[y*BINS+b]=v;
+      total+=v;
+    }
+    energy[y]=total/BINS;
+  }
+
+  // 横方向の小さな平滑化
+  for(let y=1;y<H-1;y++){
+    let e=0;
+    for(let b=0;b<BINS;b++){
+      const i=y*BINS+b;
+      feat[i]=(feat[i-BINS]+2*feat[i]+feat[i+BINS])/4;
+      e+=feat[i];
+    }
+    energy[y]=e/BINS;
+  }
+  return {W,H,feat,energy};
+}
+
+function rowNCC(A,ay,B,by){
+  const oa=ay*BINS,ob=by*BINS;
+  let ma=0,mb=0;
+  for(let k=0;k<BINS;k++){ma+=A.feat[oa+k];mb+=B.feat[ob+k]}
+  ma/=BINS;mb/=BINS;
+  let num=0,da=0,db=0;
+  for(let k=0;k<BINS;k++){
+    const a=A.feat[oa+k]-ma,b=B.feat[ob+k]-mb;
+    num+=a*b;da+=a*a;db+=b*b;
+  }
+  return num/(Math.sqrt(da*db)+1e-6);
+}
+
+function overlapScore(A,B,shift){
+  // shift = Bの先頭がAのどこに対応するか
+  const n=Math.min(A.H-shift,B.H);
+  if(n<30)return {score:-1,coverage:0,run:0};
+
+  // 画面全体を均等にサンプリング。固定UIの偶然一致を避ける。
+  const samples=Math.min(180,Math.max(60,Math.floor(n/3)));
+  let sum=0,wsum=0,good=0,run=0,bestRun=0;
+  const vals=[];
+
+  for(let s=0;s<samples;s++){
+    const j=Math.round(s*(n-1)/(samples-1));
+    const ay=shift+j,by=j;
+    const ncc=rowNCC(A,ay,B,by);
+    const e=Math.min(A.energy[ay],B.energy[by]);
+    const w=0.35+0.65*Math.min(1,Math.sqrt(e/16));
+    sum+=ncc*w;wsum+=w;
+    vals.push(ncc);
+
+    if(ncc>=0.58){good++;run++;bestRun=Math.max(bestRun,run)}
+    else if(ncc>=0.42){run=Math.max(0,run-1)}
+    else run=0;
+  }
+
+  const avg=sum/(wsum||1);
+  const coverage=good/samples;
+  const run=bestRun/samples;
+
+  // 長い重複を優先。ただし「ほぼ全部同じ」だけでは決めない。
+  const score=0.58*avg+0.27*coverage+0.15*run;
+  return {score,avg,coverage,run,bestRun};
+}
+
+function detectOverlap(A,B){
+  const maxH=Math.min(A.H,B.H);
+
+  // スクロール量 shift を広く探索。
+  // これで「重複が90%以上」のケースも候補に入る。
+  const minShift=Math.max(12,Math.floor(maxH*0.012));
+  const maxShift=Math.floor(maxH*0.97);
+
+  let best=null;
+
+  // 粗探索
+  for(let shift=minShift;shift<=maxShift;shift+=3){
+    const r=overlapScore(A,B,shift);
+    if(!best||r.score>best.score)best={shift,...r};
+  }
+
+  // 最良候補の周囲を1px精密化
+  const center=best.shift;
+  for(let shift=Math.max(minShift,center-8);shift<=Math.min(maxShift,center+8);shift++){
+    const r=overlapScore(A,B,shift);
+    if(r.score>best.score)best={shift,...r};
+  }
+
+  best.overlap=A.H-best.shift;
+
+  // 信頼度
+  best.confidence=Math.max(0,Math.min(1,
+    0.55*Math.max(0,(best.avg-0.18)/0.65)+
+    0.30*Math.min(1,best.coverage/0.70)+
+    0.15*Math.min(1,best.run/0.45)
+  ));
+
+  return best;
+}
+
+async function stitch(){
+  if(files.length<2){status('写真を2枚以上選択してください。');return}
+  $('go').disabled=true;$('save').style.display='none';$('result').style.display='none';
+  try{
+    status('画像を読み込み中…');
+    const ims=await Promise.all(files.map(loadImage));
+    const W=ims[0].naturalWidth;
+    const H=ims[0].naturalHeight;
+    for(const im of ims){
+      if(im.naturalWidth!==W||im.naturalHeight!==H){
+        status('⚠️ 画像サイズが違います。すべて同じサイズのスクリーンショットを使ってください。');
+        return;
+      }
+    }
+
+    const feats=ims.map((im,i)=>{status(`画像解析中… ${i+1}/${ims.length}`);return makeFeatures(im)});
+
+    const pairs=[];
+    for(let i=1;i<ims.length;i++){
+      status(`重複部分を検出中… ${i}/${ims.length-1}`);
+      const r=detectOverlap(feats[i-1],feats[i]);
+      pairs.push(r);
+    }
+
+    let totalH=H;
+    for(const r of pairs) totalH += H-r.overlap;
+    const MAX=30000;
+    if(totalH>MAX){
+      status(`⚠️ 出力が${totalH}pxになるため、30000pxを超えます。写真枚数を減らしてください。`);
+      return;
+    }
+
+    const canvas=document.createElement('canvas');
+    canvas.width=W;canvas.height=totalH;
+    const ctx=canvas.getContext('2d');
+    let y=0;
+    ctx.drawImage(ims[0],0,y);y+=H;
+
+    for(let i=1;i<ims.length;i++){
+      const crop=pairs[i-1].overlap;
+      ctx.drawImage(ims[i],0,crop,W,H-crop,0,y,W,H-crop);
+      y+=H-crop;
+    }
+
+    $('result').src=canvas.toDataURL('image/png');
+    $('result').style.display='block';
+    $('save').style.display='block';
+
+    let d='<div class="card"><b>🔎 検出結果</b><br>';
+    pairs.forEach((r,i)=>{
+      const conf=Math.round(r.confidence*100);
+      d+=`${i+1} → ${i+2}：重複 約${Math.round(r.overlap*H/feats[i].H)} px / 信頼度 ${conf}%${conf<50?' ⚠️':''}<br>`;
+    });
+    d+=`<small>v8：v6の基本機能を維持し、重複検出は最新方式（勾配＋2Dパターン＋連続一致）を使用しています。</small></div>`;
+    $('diag').innerHTML=d;
+    status('✅ 重複部分を検出して結合完了！');
+  }catch(e){
+    console.error(e);
+    status('❌ エラー：'+(e.message||e));
+  }finally{$('go').disabled=false}
+}
+
+$('go').onclick=stitch;
+$('save').onclick=()=>{
+  const a=document.createElement('a');
+  a.href=$('result').src;
+  a.download='ScrollStitch_'+new Date().toISOString().replace(/[-:T.Z]/g,'').slice(0,14)+'.png';
+  a.click();
+};
+</script>
+</body>
+</html>
